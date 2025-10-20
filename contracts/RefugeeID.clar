@@ -9,6 +9,14 @@
 (define-constant ERR_SELF_RELATIONSHIP (err u107))
 (define-constant ERR_RELATIONSHIP_EXISTS (err u108))
 (define-constant ERR_INVALID_RELATIONSHIP (err u109))
+(define-constant ERR_INVALID_RATING (err u110))
+(define-constant ERR_PROVIDER_NOT_FOUND (err u111))
+(define-constant ERR_DUPLICATE_RATING (err u112))
+(define-constant ERR_SUPPLY_EXISTS (err u113))
+(define-constant ERR_SUPPLY_NOT_FOUND (err u114))
+(define-constant ERR_INVALID_QUANTITY (err u115))
+(define-constant ERR_OUT_OF_STOCK (err u116))
+(define-constant ERR_DUPLICATE_DISTRIBUTION (err u117))
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var registration-fee uint u1000000)
@@ -16,6 +24,9 @@
 (define-data-var total-identities uint u0)
 (define-data-var total-aid-disbursed uint u0)
 (define-data-var total-family-links uint u0)
+(define-data-var total-provider-ratings uint u0)
+(define-data-var total-supplies uint u0)
+(define-data-var total-supplies-distributed uint u0)
 
 (define-map identities 
   principal 
@@ -124,6 +135,51 @@
     timestamp: uint,
     priority-level: uint,
     acknowledged: bool
+  }
+)
+
+(define-map provider-ratings
+  { provider: principal, rater: principal }
+  {
+    rating: uint,
+    feedback: (string-ascii 100),
+    timestamp: uint,
+    verified-by: principal
+  }
+)
+
+(define-map provider-stats
+  principal
+  {
+    total-ratings: uint,
+    average-rating: uint,
+    total-feedback-count: uint
+  }
+)
+
+(define-map medical-supplies
+  (string-ascii 30)
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    unit: (string-ascii 20),
+    total-quantity: uint,
+    available-quantity: uint,
+    creator: principal,
+    created-at: uint,
+    last-updated: uint,
+    active: bool
+  }
+)
+
+(define-map supply-distributions
+  { supply-id: (string-ascii 30), distribution-id: (string-ascii 50) }
+  {
+    recipient: principal,
+    provider: principal,
+    quantity: uint,
+    location: (string-ascii 50),
+    timestamp: uint
   }
 )
 
@@ -569,6 +625,207 @@
   )
 )
 
+(define-public (rate-service-provider
+  (provider principal)
+  (rating uint)
+  (feedback (string-ascii 100))
+)
+  (let
+    (
+      (rater-identity (unwrap! (map-get? identities tx-sender) ERR_NOT_FOUND))
+      (existing-stats (map-get? provider-stats provider))
+      (existing-rating (map-get? provider-ratings { provider: provider, rater: tx-sender }))
+    )
+    (asserts! (not (is-eq tx-sender provider)) ERR_SELF_RELATIONSHIP)
+    (asserts! (get verified rater-identity) ERR_NOT_VERIFIED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (> (len feedback) u0) ERR_INVALID_INPUTS)
+    (asserts! (is-none existing-rating) ERR_DUPLICATE_RATING)
+    
+    (map-set provider-ratings { provider: provider, rater: tx-sender }
+      {
+        rating: rating,
+        feedback: feedback,
+        timestamp: stacks-block-height,
+        verified-by: tx-sender
+      }
+    )
+    
+    (match existing-stats
+      stats (let
+        (
+          (new-total (+ (get total-ratings stats) u1))
+          (sum-ratings (+ (* (get average-rating stats) (get total-ratings stats)) rating))
+          (new-average (/ sum-ratings new-total))
+        )
+        (map-set provider-stats provider {
+          total-ratings: new-total,
+          average-rating: new-average,
+          total-feedback-count: (+ (get total-feedback-count stats) u1)
+        })
+      )
+      (map-set provider-stats provider {
+        total-ratings: u1,
+        average-rating: rating,
+        total-feedback-count: u1
+      })
+    )
+    
+    (var-set total-provider-ratings (+ (var-get total-provider-ratings) u1))
+    (ok true)
+  )
+)
+
+(define-public (update-provider-rating
+  (provider principal)
+  (new-rating uint)
+  (new-feedback (string-ascii 100))
+)
+  (let
+    (
+      (rater-identity (unwrap! (map-get? identities tx-sender) ERR_NOT_FOUND))
+      (existing-rating (unwrap! (map-get? provider-ratings { provider: provider, rater: tx-sender }) ERR_NOT_FOUND))
+      (provider-stats-info (unwrap! (map-get? provider-stats provider) ERR_PROVIDER_NOT_FOUND))
+    )
+    (asserts! (get verified rater-identity) ERR_NOT_VERIFIED)
+    (asserts! (and (>= new-rating u1) (<= new-rating u5)) ERR_INVALID_RATING)
+    (asserts! (> (len new-feedback) u0) ERR_INVALID_INPUTS)
+    
+    (let
+      (
+        (old-rating (get rating existing-rating))
+        (old-sum (* (get average-rating provider-stats-info) (get total-ratings provider-stats-info)))
+        (new-sum (- (+ old-sum new-rating) old-rating))
+        (new-average (/ new-sum (get total-ratings provider-stats-info)))
+      )
+      (map-set provider-ratings { provider: provider, rater: tx-sender }
+        (merge existing-rating {
+          rating: new-rating,
+          feedback: new-feedback,
+          timestamp: stacks-block-height
+        })
+      )
+      
+      (map-set provider-stats provider (merge provider-stats-info {
+        average-rating: new-average
+      }))
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (register-medical-supply
+  (supply-id (string-ascii 30))
+  (name (string-ascii 50))
+  (description (string-ascii 100))
+  (unit (string-ascii 20))
+  (initial-quantity uint)
+)
+  (let
+    (
+      (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (get authorized verifier-info) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? medical-supplies supply-id)) ERR_SUPPLY_EXISTS)
+    (asserts! (> (len supply-id) u0) ERR_INVALID_INPUTS)
+    (asserts! (> (len name) u0) ERR_INVALID_INPUTS)
+    (asserts! (> initial-quantity u0) ERR_INVALID_QUANTITY)
+
+    (map-set medical-supplies supply-id {
+      name: name,
+      description: description,
+      unit: unit,
+      total-quantity: initial-quantity,
+      available-quantity: initial-quantity,
+      creator: tx-sender,
+      created-at: stacks-block-height,
+      last-updated: stacks-block-height,
+      active: true
+    })
+
+    (var-set total-supplies (+ (var-get total-supplies) u1))
+    (ok supply-id)
+  )
+)
+
+(define-public (restock-medical-supply
+  (supply-id (string-ascii 30))
+  (added-quantity uint)
+)
+  (let
+    (
+      (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_NOT_AUTHORIZED))
+      (supply-info (unwrap! (map-get? medical-supplies supply-id) ERR_SUPPLY_NOT_FOUND))
+    )
+    (asserts! (get authorized verifier-info) ERR_NOT_AUTHORIZED)
+    (asserts! (> added-quantity u0) ERR_INVALID_QUANTITY)
+
+    (map-set medical-supplies supply-id
+      (merge supply-info {
+        total-quantity: (+ (get total-quantity supply-info) added-quantity),
+        available-quantity: (+ (get available-quantity supply-info) added-quantity),
+        last-updated: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (distribute-medical-supply
+  (recipient principal)
+  (supply-id (string-ascii 30))
+  (distribution-id (string-ascii 50))
+  (quantity uint)
+  (location (string-ascii 50))
+)
+  (let
+    (
+      (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_NOT_AUTHORIZED))
+      (identity-info (unwrap! (map-get? identities recipient) ERR_NOT_FOUND))
+      (supply-info (unwrap! (map-get? medical-supplies supply-id) ERR_SUPPLY_NOT_FOUND))
+    )
+    (asserts! (get authorized verifier-info) ERR_NOT_AUTHORIZED)
+    (asserts! (get verified identity-info) ERR_NOT_VERIFIED)
+    (asserts! (> quantity u0) ERR_INVALID_QUANTITY)
+    (asserts! (>= (get available-quantity supply-info) quantity) ERR_OUT_OF_STOCK)
+    (asserts! (is-none (map-get? supply-distributions { supply-id: supply-id, distribution-id: distribution-id })) ERR_DUPLICATE_DISTRIBUTION)
+
+    (map-set supply-distributions { supply-id: supply-id, distribution-id: distribution-id } {
+      recipient: recipient,
+      provider: tx-sender,
+      quantity: quantity,
+      location: location,
+      timestamp: stacks-block-height
+    })
+
+    (map-set medical-supplies supply-id
+      (merge supply-info {
+        available-quantity: (- (get available-quantity supply-info) quantity),
+        last-updated: stacks-block-height
+      })
+    )
+
+    (var-set total-supplies-distributed (+ (var-get total-supplies-distributed) quantity))
+    (ok distribution-id)
+  )
+)
+
+(define-read-only (get-medical-supply (supply-id (string-ascii 30)))
+  (map-get? medical-supplies supply-id)
+)
+
+(define-read-only (get-supply-distribution (supply-id (string-ascii 30)) (distribution-id (string-ascii 50)))
+  (map-get? supply-distributions { supply-id: supply-id, distribution-id: distribution-id })
+)
+
+(define-read-only (get-supply-stats)
+  {
+    total-supplies: (var-get total-supplies),
+    total-supplies-distributed: (var-get total-supplies-distributed)
+  }
+)
+
 (define-read-only (get-identity (identity principal))
   (map-get? identities identity)
 )
@@ -648,6 +905,14 @@
     relationship-data (get mutual-consent relationship-data)
     false
   )
+)
+
+(define-read-only (get-provider-rating (provider principal) (rater principal))
+  (map-get? provider-ratings { provider: provider, rater: rater })
+)
+
+(define-read-only (get-provider-stats (provider principal))
+  (map-get? provider-stats provider)
 )
 
 (define-public (update-fees (new-registration-fee uint) (new-verification-fee uint))
